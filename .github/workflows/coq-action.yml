@@ -1,17 +1,16 @@
----
 name: CI
 run-name: "CI ${{ inputs.leg || github.event_name }} ${{ inputs.racecar_run }}"
 
 on:
   push:
     branches:
-      - master
-      - vst_on_iris
+    - master
+    - vst_on_iris
     paths-ignore:
-      - 'lib/**'
+    - 'lib/**'
   pull_request:
     paths-ignore:
-      - 'lib/**'
+    - 'lib/**'
 
   workflow_dispatch:
     inputs:
@@ -44,74 +43,146 @@ jobs:
         # except for the "make_target" field and make_target related excludes
         coq_version:
           # See https://github.com/coq-community/docker-coq/wiki for supported images
-          - '9.1'
-          - 'dev'
+        - '9.1'
+        - 'dev'
         bit_size:
-          - 32
-          - 64
+        - 32
+        - 64
         make_target:
-          - vst
+        - vst
         exclude:
-          - coq_version: 9.1
-            bit_size: 32
-          - coq_version: dev
-            bit_size: 32
+        - coq_version: 9.1
+          bit_size: 32
+        - coq_version: dev
+          bit_size: 32
     steps:
-      - uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-          submodules: true
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - uses: coq-community/docker-coq-action@v1
-        with:
-          coq_version: ${{ matrix.coq_version }}
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+        submodules: true
+    - uses: coq-community/docker-coq-action@v1
+      with:
+        coq_version: ${{ matrix.coq_version }}
           # See https://github.com/coq-community/docker-coq-action/tree/v1 for usage
-          before_install: |
-            startGroup "Opam config"
-              opam repo add -y prerelease file://$(pwd)/opam-prerelease
-              opam update -y
-              opam config list; opam repo list; opam list
-            endGroup
-          install: |
-            startGroup "Install dependencies"
-              opam install -y coq-stdlib
-              opam install -y coq-flocq
-              opam install -y ${{ matrix.coq_version == '9.0' && matrix.bit_size == 64 && 'coq-compcert.3.16' }} || exit_code=$?
-              # Required by test2
-              opam install -y coq-ext-lib coq-itree
-            endGroup
-          # See https://github.com/coq-community/docker-coq-action/tree/v1#permissions
-          before_script: |
-            startGroup "Workaround permission issue"
-              sudo chmod -R a=u .
-            endGroup
-          script: |
-            startGroup "Build & Install"
+        before_install: |
+          startGroup "Opam config"
+            opam repo add -y prerelease file://$(pwd)/opam-prerelease
+            opam update -y
+            opam config list; opam repo list; opam list
+          endGroup
+        install: |
+          startGroup "Install dependencies"
+            opam install -y coq-stdlib
+            opam install -y coq-flocq
+            opam install -y ${{ matrix.coq_version == '9.0' && matrix.bit_size == 64 && 'coq-compcert.3.16' }} || exit_code=$?
+            # Required by test2
+            opam install -y coq-ext-lib coq-itree
+          endGroup
+         # See https://github.com/coq-community/docker-coq-action/tree/v1#permissions
+        before_script: |
+          startGroup "Workaround permission issue"
+            sudo chmod -R a=u .
+          endGroup
+        script: |
+          startGroup "Build & Install"
 
-              make ${{matrix.make_target}} BITSIZE=${{matrix.bit_size}} COMPCERT=${{ matrix.bit_size==64 && matrix.coq_version == '9.0' && 'platform' || 'bundled' }} IGNORECOQVERSION=true IGNORECOMPCERTVERSION=true
-            endGroup
-          after_script: |
-            startGroup 'Copy Opam coq/user-contrib and coq-variant'
-              cp -R -v "$(opam var lib)"/coq/user-contrib .
-              mkdir -p "$(opam var lib)"/coq-variant/dummy
-              cp -R -v "$(opam var lib)"/coq-variant .
-            endGroup
-          uninstall:
-      - name: 'Create archive'
-        run: tar -cpvzf archive.tgz * .depend
-      - name: 'Upload archive'
-        uses: actions/upload-artifact@v4
-        with:
-          name: 'VST build artifacts ${{matrix.coq_version}} ${{matrix.bit_size}}'
-          path: archive.tgz
-          retention-days: 1
+            make ${{matrix.make_target}} BITSIZE=${{matrix.bit_size}} COMPCERT=${{ matrix.bit_size==64 && matrix.coq_version == '9.0' && 'platform' || 'bundled' }} IGNORECOQVERSION=true IGNORECOMPCERTVERSION=true
+          endGroup
+        after_script: |
+          startGroup 'Copy Opam coq/user-contrib and coq-variant'
+            cp -R -v "$(opam var lib)"/coq/user-contrib .
+            mkdir -p "$(opam var lib)"/coq-variant/dummy
+            cp -R -v "$(opam var lib)"/coq-variant .
+          endGroup
+        uninstall:
+    - name: 'Create archive'
+      run: tar -cpvzf archive.tgz * .depend
+    - name: 'Upload archive'
+      uses: actions/upload-artifact@v4
+      with:
+        name: 'VST build artifacts ${{matrix.coq_version}} ${{matrix.bit_size}}'
+        path: archive.tgz
+        retention-days: 1
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   test:
     needs: build
     runs-on: ubuntu-latest
@@ -119,59 +190,59 @@ jobs:
       fail-fast: false
       matrix:
         coq_version:
-          - '9.1'
-          - 'dev' 
+        - '9.1'
+        - 'dev'
         make_target:
-          - assumptions.txt
-          - test
-          - test2
-          - test3
-          - test4
-          - test5
+        - assumptions.txt
+        - test
+        - test2
+        - test3
+        - test4
+        - test5
         bit_size:
-          - 32
-          - 64
+        - 32
+        - 64
         exclude:
-          - coq_version: 9.1
-            bit_size: 32  # can unexclude this once coq-paco installs
-          - coq_version: 9.1
-            make_target: test2
-          - coq_version: dev
-            bit_size: 32
-          - bit_size: 64
-            make_target: test3
-          - bit_size: 32
-            make_target: test4
-          - bit_size: 32
-            make_target: test5
+        - coq_version: 9.1
+          bit_size: 32    # can unexclude this once coq-paco installs
+        - coq_version: 9.1
+          make_target: test2
+        - coq_version: dev
+          bit_size: 32
+        - bit_size: 64
+          make_target: test3
+        - bit_size: 32
+          make_target: test4
+        - bit_size: 32
+          make_target: test5
 
     steps:
-      - name: 'Download archive'
-        uses: actions/download-artifact@v4
-        id: download
-        with:
-          name: 'VST build artifacts ${{matrix.coq_version}} ${{matrix.bit_size}}'
-      - name: 'Extract archive'
-        run: tar -xvpzf archive.tgz
-      - uses: coq-community/docker-coq-action@v1
-        with:
-          coq_version: ${{ matrix.coq_version }}
-          install: |
-            startGroup "Copy downloaded Opam coq/user-contrib and coq-variant"
-              opam install -y coq
-              cp -R -v user-contrib/* "$(opam var lib)"/coq/user-contrib
-              mkdir -p "$(opam var lib)"/coq-variant
-              cp -R -v coq-variant/* "$(opam var lib)"/coq-variant
-            endGroup
-          before_script: |
-            startGroup "Workaround permission issue"
-              sudo chmod -R a=u .
-            endGroup
-          script: |
-            startGroup "Build & Install"
-              make -f util/make-touch  IGNORECOQVERSION=true IGNORECOMPCERTVERSION=true
-              # use the first version only when coq-released has a version of CompCert compatible with this VST
-              # make ${{matrix.make_target}} BITSIZE=${{matrix.bit_size}} COMPCERT=${{ matrix.coq_version=='dev' && 'bundled' || 'platform' }}  IGNORECOQVERSION=true IGNORECOMPCERTVERSION=true
-              make ${{matrix.make_target}} BITSIZE=${{matrix.bit_size}} COMPCERT=bundled IGNORECOQVERSION=true IGNORECOMPCERTVERSION=true
-            endGroup
-          uninstall:
+    - name: 'Download archive'
+      uses: actions/download-artifact@v4
+      id: download
+      with:
+        name: 'VST build artifacts ${{matrix.coq_version}} ${{matrix.bit_size}}'
+    - name: 'Extract archive'
+      run: tar -xvpzf archive.tgz
+    - uses: coq-community/docker-coq-action@v1
+      with:
+        coq_version: ${{ matrix.coq_version }}
+        install: |
+          startGroup "Copy downloaded Opam coq/user-contrib and coq-variant"
+            opam install -y coq
+            cp -R -v user-contrib/* "$(opam var lib)"/coq/user-contrib
+            mkdir -p "$(opam var lib)"/coq-variant
+            cp -R -v coq-variant/* "$(opam var lib)"/coq-variant
+          endGroup
+        before_script: |
+          startGroup "Workaround permission issue"
+            sudo chmod -R a=u .
+          endGroup
+        script: |
+          startGroup "Build & Install"
+            make -f util/make-touch  IGNORECOQVERSION=true IGNORECOMPCERTVERSION=true
+            # use the first version only when coq-released has a version of CompCert compatible with this VST
+            # make ${{matrix.make_target}} BITSIZE=${{matrix.bit_size}} COMPCERT=${{ matrix.coq_version=='dev' && 'bundled' || 'platform' }}  IGNORECOQVERSION=true IGNORECOMPCERTVERSION=true
+            make ${{matrix.make_target}} BITSIZE=${{matrix.bit_size}} COMPCERT=bundled IGNORECOQVERSION=true IGNORECOMPCERTVERSION=true
+          endGroup
+        uninstall:
